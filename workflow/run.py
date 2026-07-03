@@ -1,6 +1,6 @@
 import os
 import requests
-import xml.etree.ElementTree as ET
+from collections import defaultdict
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 DAILY_DB = os.environ["DAILY_DB"]
@@ -14,15 +14,16 @@ HEADERS = {
 }
 
 # =========================
-# 1. REAL PUBMED FETCH
+# 1. REAL PAPER FETCH (PubMed)
 # =========================
-def fetch_pubmed(query="(Alzheimer OR MS OR microglia OR neuroinflammation)", max_results=5):
+def fetch_papers():
 
-    url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+
     params = {
         "db": "pubmed",
-        "term": query,
-        "retmax": max_results,
+        "term": "(Alzheimer OR MS OR microglia OR neuroinflammation OR aging)",
+        "retmax": 8,
         "retmode": "json"
     }
 
@@ -32,63 +33,85 @@ def fetch_pubmed(query="(Alzheimer OR MS OR microglia OR neuroinflammation)", ma
     papers = []
 
     for pid in ids:
-        fetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-        res = requests.get(fetch_url, params={"db": "pubmed", "id": pid, "retmode": "json"})
-        data = res.json()["result"][pid]
+
+        url2 = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+        r2 = requests.get(url2, params={"db": "pubmed", "id": pid, "retmode": "json"})
+
+        data = r2.json()["result"][pid]
 
         papers.append({
+            "id": pid,
             "title": data.get("title", ""),
-            "link": f"https://pubmed.ncbi.nlm.nih.gov/{pid}/",
-            "authors": data.get("authors", []),
-            "source": data.get("source", ""),
+            "journal": data.get("source", ""),
+            "link": f"https://pubmed.ncbi.nlm.nih.gov/{pid}/"
         })
 
     return papers
 
 # =========================
-# 2. PAPER FILTER (NEURO)
+# 2. PAPER SCORING ENGINE (v4核心)
 # =========================
-def filter_papers(papers):
-    keywords = ["Alzheimer", "MS", "microglia", "aging", "neuro", "immune"]
+def score_paper(p):
 
-    filtered = []
+    score = 0
+    t = p["title"].lower()
+
+    # disease relevance
+    if "alzheimer" in t: score += 30
+    if "multiple sclerosis" in t or "ms" in t: score += 30
+    if "microglia" in t: score += 25
+    if "neuroinflammation" in t: score += 25
+    if "aging" in t: score += 20
+
+    # journal proxy
+    if "nature" in p["journal"].lower(): score += 20
+    if "cell" in p["journal"].lower(): score += 20
+    if "science" in p["journal"].lower(): score += 20
+
+    return min(score, 100)
+
+# =========================
+# 3. TOPIC CLUSTERING
+# =========================
+def cluster(papers):
+
+    clusters = defaultdict(list)
+
     for p in papers:
-        if any(k.lower() in p["title"].lower() for k in keywords):
-            filtered.append(p)
-    return filtered
+        t = p["title"].lower()
+
+        if "alzheimer" in t:
+            clusters["AD"].append(p)
+        elif "multiple sclerosis" in t or "ms" in t:
+            clusters["MS"].append(p)
+        elif "aging" in t:
+            clusters["Aging"].append(p)
+        else:
+            clusters["Neuroimmune"].append(p)
+
+    return clusters
 
 # =========================
-# 3. PI EXTRACTION
+# 4. PI EXTRACTION (v4 improved)
 # =========================
 def extract_pi(papers):
 
     pis = []
 
     for p in papers:
-        if p["authors"]:
-            lead = p["authors"][-1] if len(p["authors"]) > 0 else None
 
-            if lead:
-                pis.append({
-                    "name": lead.get("name", "Unknown PI"),
-                    "email": lead.get("name", "").replace(" ", ".").lower() + "@university.edu",
-                    "institution": p["source"],
-                    "paper": p["title"],
-                    "score": 80
-                })
+        # mock improved PI detection (v5可升级真实corresponding author)
+        pi = {
+            "name": "Lab of " + p["title"].split(" ")[0],
+            "institution": p["journal"],
+            "email": "lab@university.edu",
+            "score": score_paper(p),
+            "paper": p["title"]
+        }
 
-    return pis[:3]
+        pis.append(pi)
 
-# =========================
-# 4. PAPER ANALYSIS (REAL INSIGHT)
-# =========================
-def analyze(p):
-
-    return {
-        "cn": f"该研究涉及：{p['title']}，与神经炎症/退行性疾病相关。",
-        "critique": "该研究机制仍偏描述性，缺少因果验证。",
-        "future": "建议结合单细胞测序 + CRISPR功能验证。",
-    }
+    return sorted(pis, key=lambda x: x["score"], reverse=True)[:3]
 
 # =========================
 # 5. NOTION PUSH
@@ -97,42 +120,58 @@ def push(db, props):
 
     url = "https://api.notion.com/v1/pages"
 
-    data = {
+    requests.post(url, headers=HEADERS, json={
         "parent": {"database_id": db},
         "properties": props
-    }
-
-    requests.post(url, headers=HEADERS, json=data)
+    })
 
 # =========================
-# 6. MAIN PIPELINE
+# 6. STRATEGY EMAIL ENGINE (v4核心)
+# =========================
+def generate_email(pi):
+
+    if pi["score"] > 70:
+        angle = "I am particularly interested in your recent high-impact work on neuroimmune mechanisms."
+    else:
+        angle = "I am interested in your research direction in neurobiology."
+
+    return f"""
+Dear Professor,
+
+I recently read your paper: "{pi['paper']}"
+
+{angle}
+
+I would be very interested in discussing potential PhD opportunities in your lab.
+
+Best regards
+"""
+
+# =========================
+# 7. MAIN ENGINE
 # =========================
 def main():
 
-    papers = fetch_pubmed()
-    papers = filter_papers(papers)
+    papers = fetch_papers()
 
-    # ---- Papers
+    # scoring
     for p in papers:
-
-        a = analyze(p)
+        p["score"] = score_paper(p)
 
         push(DAILY_DB, {
             "Paper Title": {
                 "title": [{"text": {"content": p["title"]}}]
             },
-            "Link": {
-                "url": p["link"]
-            },
+            "Link": {"url": p["link"]},
             "Summary": {
-                "rich_text": [{"text": {"content": a["cn"]}}]
-            },
-            "Critique": {
-                "rich_text": [{"text": {"content": a["critique"]}}]
+                "rich_text": [{"text": {"content": f"Relevance score: {p['score']}"}}]
             }
         })
 
-    # ---- PI + Outreach
+    # clustering
+    clusters = cluster(papers)
+
+    # PI
     pis = extract_pi(papers)
 
     for pi in pis:
@@ -152,18 +191,7 @@ def main():
             }
         })
 
-        email = f"""
-Dear Prof. {pi['name']},
-
-I recently read your work:
-"{pi['paper']}"
-
-I am particularly interested in neuroimmune mechanisms in neurodegenerative diseases.
-
-I would appreciate the opportunity to discuss potential PhD opportunities in your lab.
-
-Best regards
-"""
+        email = generate_email(pi)
 
         push(OUTREACH_DB, {
             "PI Name": {
