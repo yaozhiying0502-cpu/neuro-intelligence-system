@@ -2,6 +2,9 @@ import os
 import requests
 import time
 
+# =========================
+# ENV
+# =========================
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 DAILY_DB = os.environ["DAILY_DB"]
 PI_DB = os.environ["PI_DB"]
@@ -14,13 +17,13 @@ HEADERS = {
 }
 
 # =========================
-# 1. PUBMED FETCH (SAFE)
+# 1. PUBMED SEARCH
 # =========================
 def fetch_pubmed():
 
-    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-
     try:
+        url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+
         r = requests.get(url, params={
             "db": "pubmed",
             "term": "(Alzheimer OR MS OR microglia OR neuroinflammation OR aging)",
@@ -31,9 +34,7 @@ def fetch_pubmed():
         data = r.json()
         ids = data.get("esearchresult", {}).get("idlist", [])
 
-        if not ids:
-            print("⚠️ No PubMed results")
-            return []
+        print("PUBMED IDS:", ids)
 
         return ids
 
@@ -42,7 +43,7 @@ def fetch_pubmed():
         return []
 
 # =========================
-# 2. GET PAPER DETAILS
+# 2. PAPER DETAILS
 # =========================
 def fetch_details(pid):
 
@@ -61,55 +62,154 @@ def fetch_details(pid):
             "title": j.get("title", "No title"),
             "link": f"https://pubmed.ncbi.nlm.nih.gov/{pid}/",
             "authors": j.get("authors", []),
-            "journal": j.get("source", "")
+            "journal": j.get("source", ""),
+            "affiliation": j.get("elocationid", "")  # fallback field
         }
 
     except Exception as e:
-        print("paper error:", e)
+        print("❌ paper error:", e)
         return None
 
 # =========================
-# 3. PI EXTRACTION (FIXED v4.2)
+# 3. PI ENRICHMENT
+# =========================
+def enrich_pi(name, paper):
+
+    institution = "unknown"
+    email = "unknown"
+
+    aff = paper.get("affiliation", "")
+
+    if aff:
+        institution = aff
+
+    # heuristic cleaning
+    if institution != "unknown":
+        institution = institution.split(";")[0]
+
+    if institution != "unknown":
+        domain = institution.lower().replace(" ", "").replace(",", "")
+        email = f"{name.split()[-1].lower()}@{domain}.edu"
+
+    return institution, email
+
+# =========================
+# 4. PI EXTRACTION
 # =========================
 def extract_pi(paper):
 
+    authors = paper.get("authors", [])
+
+    if not authors:
+        return []
+
     pis = []
 
-    try:
-        authors = paper.get("authors", [])
+    last_author = authors[-1].get("name", "")
 
-        for a in authors:
+    institution, email = enrich_pi(last_author, paper)
 
-            name = a.get("name", "")
+    pis.append({
+        "name": last_author,
+        "institution": institution,
+        "email": email,
+        "paper": paper["title"],
+        "journal": paper.get("journal", "")
+    })
 
-            # heuristic: last author = PI candidate
-            if name and (len(name.split()) > 0):
-
-                pis.append({
-                    "name": name,
-                    "email": "unknown",
-                    "institution": "unknown",
-                    "paper": paper["title"]
-                })
-
-        # keep only last author as PI (common academic rule)
-        if pis:
-            return [pis[-1]]
-
-        return []
-
-    except Exception as e:
-        print("PI extract error:", e)
-        return []
+    return pis
 
 # =========================
-# 4. NOTION SAFE WRITE (CRITICAL FIX)
+# 5. PI SCORING SYSTEM
 # =========================
-def notion_write(db, props):
+def score_pi(pi):
 
-    url = "https://api.notion.com/v1/pages"
+    score = 0
+
+    text = (pi.get("paper","") + pi.get("journal","")).lower()
+
+    # disease relevance
+    if "alzheimer" in text:
+        score += 30
+    if "multiple sclerosis" in text:
+        score += 30
+    if "microglia" in text:
+        score += 25
+    if "neuroinflammation" in text:
+        score += 25
+    if "aging" in text:
+        score += 15
+
+    # institution quality
+    inst = pi.get("institution","").lower()
+
+    if "harvard" in inst:
+        score += 25
+    if "stanford" in inst:
+        score += 25
+    if "ucl" in inst:
+        score += 15
+    if "university" in inst:
+        score += 10
+
+    # email availability bonus
+    if pi.get("email") != "unknown":
+        score += 10
+
+    return min(score, 100)
+
+# =========================
+# 6. CRITIQUE ENGINE
+# =========================
+def critique(paper):
+
+    return f"""
+Key Idea:
+{paper['title']}
+
+Strength:
+- neuroimmunology relevance high
+- translational potential exists
+
+Limitation:
+- model validation unclear
+- sample size likely small
+
+Follow-up questions:
+- how does this relate to AD-MS comorbidity?
+- is microglia activation causal or correlative?
+"""
+
+# =========================
+# 7. OUTREACH EMAIL GENERATOR
+# =========================
+def generate_email(pi, paper):
+
+    return f"""
+Dear Dr. {pi['name']},
+
+I recently read your work:
+"{paper['title']}"
+
+I found your study particularly interesting in the context of
+neuroimmune mechanisms in Alzheimer’s disease and multiple sclerosis.
+
+One question I had:
+How do you distinguish aging-related microglial activation from disease-driven inflammation?
+
+I would be very grateful for the opportunity to discuss your work further.
+
+Best regards,
+"""
+
+# =========================
+# 8. NOTION PUSH (SAFE)
+# =========================
+def push(db, props):
 
     try:
+        url = "https://api.notion.com/v1/pages"
+
         r = requests.post(url, headers=HEADERS, json={
             "parent": {"database_id": db},
             "properties": props
@@ -118,31 +218,32 @@ def notion_write(db, props):
         print("NOTION STATUS:", r.status_code)
         print("NOTION RESPONSE:", r.text)
 
-        # 🔥 critical fix
-        if r.status_code != 200:
-            print("❌ Notion write failed")
-            return False
-
-        return True
+        return r.status_code == 200
 
     except Exception as e:
-        print("❌ Notion exception:", e)
+        print("❌ Notion error:", e)
         return False
 
 # =========================
-# 5. MAIN PIPELINE (v4.2)
+# 9. RANK PI LIST
+# =========================
+def rank_pis(pis):
+
+    for p in pis:
+        p["score"] = score_pi(p)
+
+    return sorted(pis, key=lambda x: x["score"], reverse=True)
+
+# =========================
+# 10. MAIN PIPELINE
 # =========================
 def main():
 
-    print("🚀 v4.2 running...")
+    print("🚀 v5 FULL START")
 
     ids = fetch_pubmed()
 
-    if not ids:
-        print("❌ no ids")
-        return
-
-    all_papers = []
+    all_pis = []
 
     for pid in ids:
 
@@ -151,12 +252,10 @@ def main():
         if not paper:
             continue
 
-        all_papers.append(paper)
-
         # =====================
         # WRITE PAPER
         # =====================
-        success = notion_write(DAILY_DB, {
+        push(DAILY_DB, {
             "Paper Title": {
                 "title": [{"text": {"content": paper["title"]}}]
             },
@@ -169,29 +268,58 @@ def main():
         })
 
         # =====================
-        # EXTRACT PI
+        # PI PROCESSING
         # =====================
         pis = extract_pi(paper)
 
-        print("PI FOUND:", len(pis))
-
         for pi in pis:
 
-            notion_write(PI_DB, {
+            pi["score"] = score_pi(pi)
+            all_pis.append(pi)
+
+            push(PI_DB, {
                 "PI Name": {
                     "title": [{"text": {"content": pi["name"]}}]
                 },
                 "Email": {
                     "rich_text": [{"text": {"content": pi["email"]}}]
                 },
+                "Institution": {
+                    "rich_text": [{"text": {"content": pi["institution"]}}]
+                },
                 "Field": {
                     "rich_text": [{"text": {"content": pi["paper"]}}]
                 }
             })
 
+            # OPTIONAL: outreach draft
+            email = generate_email(pi, paper)
+
+            push(OUTREACH_DB, {
+                "PI Name": {
+                    "title": [{"text": {"content": pi["name"]}}]
+                },
+                "Email Draft": {
+                    "rich_text": [{"text": {"content": email}}]
+                },
+                "Status": {
+                    "rich_text": [{"text": {"content": "draft"}}]
+                }
+            })
+
         time.sleep(0.5)
 
-    print("✅ v4.2 done")
+    # =====================
+    # RANKING OUTPUT
+    # =====================
+    ranked = rank_pis(all_pis)
+
+    print("\n🔥 TOP PIs TODAY")
+
+    for p in ranked[:5]:
+        print(p["name"], p["score"], p["institution"])
+
+    print("✅ v5 FULL DONE")
 
 if __name__ == "__main__":
     main()
