@@ -1,0 +1,29 @@
+name: Neuro System
+
+on:
+  schedule:
+    - cron: "0 */8 * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Run script
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DAILY_DB: ${{ secrets.DAILY_DB }}
+          PI_DB: ${{ secrets.PI_DB }}
+          OUTREACH_DB: ${{ secrets.OUTREACH_DB }}
+        run: python workflow/run.py
